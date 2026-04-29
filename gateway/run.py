@@ -2038,6 +2038,39 @@ class GatewayRunner:
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
 
+
+    def _mark_running_sessions_resume_pending(self, reason: str) -> set[str]:
+        """Persist active real-agent sessions as recoverable before shutdown drain.
+
+        The mark is deliberately written *before* waiting for the drain so a
+        service manager SIGKILL cannot erase the recovery breadcrumb.  Callers
+        that complete the drain cleanly must clear the returned keys.
+        """
+        marked: set[str] = set()
+        for _sk, _agent in list(self._running_agents.items()):
+            if _agent is _AGENT_PENDING_SENTINEL:
+                continue
+            try:
+                if self.session_store.mark_resume_pending(_sk, reason):
+                    marked.add(_sk)
+            except Exception as _e:
+                logger.debug(
+                    "mark_resume_pending failed for %s: %s",
+                    _sk, _e,
+                )
+        return marked
+
+    def _clear_preemptive_resume_marks(self, session_keys: set[str]) -> None:
+        """Clear pre-drain resume marks for sessions that shut down cleanly."""
+        for _sk in session_keys:
+            try:
+                self.session_store.clear_resume_pending(_sk)
+            except Exception as _e:
+                logger.debug(
+                    "clear preemptive resume_pending failed for %s: %s",
+                    _sk, _e,
+                )
+
     async def _notify_active_sessions_of_shutdown(self) -> None:
         """Send a notification to every chat with an active agent.
 
@@ -3018,9 +3051,39 @@ class GatewayRunner:
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()
 
+            # Persist recovery breadcrumbs BEFORE entering the drain wait.
+            # systemd can SIGKILL exactly at TimeoutStopSec; if that happens
+            # before the old timeout-only marking branch runs, startup sees no
+            # recoverable session and cannot notify the user. Clean drains clear
+            # these marks below, so the pre-mark is safe.
+            _resume_reason = (
+                "restart_timeout" if self._restart_requested else "shutdown_timeout"
+            )
+            preemptively_marked_resume = self._mark_running_sessions_resume_pending(
+                _resume_reason
+            )
+
             timeout = self._restart_drain_timeout
             active_agents, timed_out = await self._drain_active_agents(timeout)
+            if not timed_out:
+                # All agents finished before the drain deadline. Remove the
+                # conservative pre-drain recovery marks so users do not get a
+                # false interruption notice on the next startup/message.
+                self._clear_preemptive_resume_marks(preemptively_marked_resume)
+
             if timed_out:
+                still_running_real = {
+                    _sk
+                    for _sk, _agent in list(self._running_agents.items())
+                    if _agent is not _AGENT_PENDING_SENTINEL
+                }
+                completed_during_drain = preemptively_marked_resume - still_running_real
+                if completed_during_drain:
+                    # These sessions were conservatively marked before the
+                    # drain wait but finished before the timeout edge. Clear
+                    # their marks so only truly interrupted sessions recover.
+                    self._clear_preemptive_resume_marks(completed_during_drain)
+
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s); interrupting remaining work.",
                     timeout,
@@ -3047,19 +3110,12 @@ class GatewayRunner:
                 # _interrupt_running_agents() does: their agent hasn't
                 # started yet, there's nothing to interrupt, and the
                 # session shouldn't carry a misleading resume flag.
-                _resume_reason = (
-                    "restart_timeout" if self._restart_requested else "shutdown_timeout"
-                )
-                for _sk, _agent in list(self._running_agents.items()):
-                    if _agent is _AGENT_PENDING_SENTINEL:
-                        continue
-                    try:
-                        self.session_store.mark_resume_pending(_sk, _resume_reason)
-                    except Exception as _e:
-                        logger.debug(
-                            "mark_resume_pending failed for %s: %s",
-                            _sk, _e,
-                        )
+                # Refresh marks for sessions that are STILL running at the
+                # timeout edge.  Sessions that completed during the drain have
+                # already cleared their own resume flag in the successful-turn
+                # path; this second mark updates timestamps/reason for the
+                # genuinely interrupted remainder.
+                self._mark_running_sessions_resume_pending(_resume_reason)
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
@@ -3171,22 +3227,20 @@ class GatewayRunner:
 
             # Write a clean-shutdown marker so the next startup knows this
             # wasn't a crash.  suspend_recently_active() only needs to run
-            # after unexpected exits.  However, if the drain timed out and
-            # agents were force-interrupted, their sessions may be in an
-            # incomplete state (trailing tool response, no final assistant
-            # message).  Skip the marker in that case so the next startup
-            # suspends those sessions — giving users a clean slate instead
-            # of resuming a half-finished tool loop.
-            if not timed_out:
+            # after unexpected exits.  If the drain timed out, interrupted
+            # sessions have already been marked resume_pending, so startup must
+            # skip blanket suspension and let the recovery-notification path
+            # surface them to the user.
+            if not timed_out or preemptively_marked_resume:
                 try:
                     (_hermes_home / ".clean_shutdown").touch()
                 except Exception:
                     pass
             else:
                 logger.info(
-                    "Skipping .clean_shutdown marker — drain timed out with "
-                    "interrupted agents; next startup will suspend recently "
-                    "active sessions."
+                    "Skipping .clean_shutdown marker — drain timed out before "
+                    "any recovery marks were persisted; next startup will "
+                    "fall back to suspending recently active sessions."
                 )
 
             # Track sessions that were active at shutdown for stuck-loop

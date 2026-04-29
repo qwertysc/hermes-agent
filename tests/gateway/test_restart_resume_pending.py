@@ -800,9 +800,9 @@ async def test_drain_timeout_uses_restart_reason_when_restarting():
 
 
 @pytest.mark.asyncio
-async def test_clean_drain_does_not_mark_resume_pending():
-    """If the drain completes within timeout (no force-interrupt), no
-    sessions should be flagged — the normal shutdown path is unchanged."""
+async def test_clean_drain_clears_preemptive_resume_mark():
+    """If the drain completes within timeout (no force-interrupt), the
+    pre-drain recovery mark should be cleared before shutdown finishes."""
     runner, adapter = make_restart_runner()
     adapter.disconnect = AsyncMock()
 
@@ -818,6 +818,7 @@ async def test_clean_drain_does_not_mark_resume_pending():
 
     session_store = MagicMock()
     session_store.mark_resume_pending = MagicMock(return_value=True)
+    session_store.clear_resume_pending = MagicMock(return_value=True)
     runner.session_store = session_store
 
     with patch("gateway.status.remove_pid_file"), patch(
@@ -825,7 +826,12 @@ async def test_clean_drain_does_not_mark_resume_pending():
     ):
         await runner.stop()
 
-    session_store.mark_resume_pending.assert_not_called()
+    session_store.mark_resume_pending.assert_called_once_with(
+        "agent:main:telegram:dm:A", "shutdown_timeout"
+    )
+    session_store.clear_resume_pending.assert_called_once_with(
+        "agent:main:telegram:dm:A"
+    )
     running_agent.interrupt.assert_not_called()
 
 
@@ -860,6 +866,7 @@ async def test_drain_timeout_only_marks_still_running_sessions():
 
     session_store = MagicMock()
     session_store.mark_resume_pending = MagicMock(return_value=True)
+    session_store.clear_resume_pending = MagicMock(return_value=True)
     runner.session_store = session_store
 
     with patch("gateway.status.remove_pid_file"), patch(
@@ -869,8 +876,12 @@ async def test_drain_timeout_only_marks_still_running_sessions():
 
     calls = session_store.mark_resume_pending.call_args_list
     marked = {args[0][0] for args in calls}
-    # Only the session still running at timeout is marked; the finisher is not.
-    assert marked == {session_key_stuck}
+    # Pre-drain marking is conservative and includes both sessions, but the
+    # finisher is cleared before shutdown completes; the stuck session is
+    # refreshed at timeout and remains recoverable.
+    assert marked == {session_key_finisher, session_key_stuck}
+    session_store.clear_resume_pending.assert_called_once_with(session_key_finisher)
+    assert calls[-1].args[0] == session_key_stuck
 
 
 @pytest.mark.asyncio
@@ -1120,3 +1131,29 @@ class TestStuckLoopEscalation:
 
         assert store._entries[entry.session_key].resume_pending is False
         assert not counts_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# systemd TimeoutStopSec headroom
+# ---------------------------------------------------------------------------
+
+
+def test_systemd_unit_timeout_stop_exceeds_restart_drain_timeout(monkeypatch):
+    from hermes_cli import gateway as gateway_cli
+
+    monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 60.0)
+
+    unit = gateway_cli.generate_systemd_unit(system=False)
+
+    assert "TimeoutStopSec=90" in unit
+
+
+def test_systemd_unit_timeout_stop_has_minimum_headroom(monkeypatch):
+    from hermes_cli import gateway as gateway_cli
+
+    monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
+
+    unit = gateway_cli.generate_systemd_unit(system=False)
+
+    # Preserve the historic 60s floor, then add 30s for cleanup headroom.
+    assert "TimeoutStopSec=90" in unit
