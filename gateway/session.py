@@ -16,7 +16,7 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -470,6 +470,8 @@ class SessionEntry:
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
+    recovery_notified_at: Optional[datetime] = None
+    recovery_notification_error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -497,6 +499,12 @@ class SessionEntry:
                 if self.last_resume_marked_at
                 else None
             ),
+            "recovery_notified_at": (
+                self.recovery_notified_at.isoformat()
+                if self.recovery_notified_at
+                else None
+            ),
+            "recovery_notification_error": self.recovery_notification_error,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -523,6 +531,14 @@ class SessionEntry:
             except (TypeError, ValueError):
                 last_resume_marked_at = None
 
+        recovery_notified_at = None
+        _rna = data.get("recovery_notified_at")
+        if _rna:
+            try:
+                recovery_notified_at = datetime.fromisoformat(_rna)
+            except (TypeError, ValueError):
+                recovery_notified_at = None
+
         return cls(
             session_key=data["session_key"],
             session_id=data["session_id"],
@@ -545,6 +561,8 @@ class SessionEntry:
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
+            recovery_notified_at=recovery_notified_at,
+            recovery_notification_error=data.get("recovery_notification_error"),
         )
 
 
@@ -982,6 +1000,8 @@ class SessionStore:
                 entry.resume_pending = True
                 entry.resume_reason = reason
                 entry.last_resume_marked_at = _now()
+                entry.recovery_notified_at = None
+                entry.recovery_notification_error = None
                 self._save()
                 return True
         return False
@@ -1003,6 +1023,43 @@ class SessionStore:
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
+            entry.recovery_notified_at = None
+            entry.recovery_notification_error = None
+            self._save()
+            return True
+
+    def list_resume_pending(self) -> List[SessionEntry]:
+        """Return recoverable interrupted sessions that need startup notices.
+
+        Startup uses this after platform adapters connect to send a one-shot
+        progress/recovery notice back to the original chat.  A shallow copy is
+        returned so callers can perform network I/O without holding the store
+        lock.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            return [
+                replace(entry)
+                for entry in self._entries.values()
+                if entry.resume_pending
+                and not entry.suspended
+                and entry.recovery_notified_at is None
+            ]
+
+    def mark_recovery_notified(
+        self,
+        session_key: str,
+        *,
+        error: Optional[str] = None,
+    ) -> bool:
+        """Mark a resume-pending session's startup recovery notice as attempted."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or not entry.resume_pending:
+                return False
+            entry.recovery_notified_at = _now()
+            entry.recovery_notification_error = error
             self._save()
             return True
 

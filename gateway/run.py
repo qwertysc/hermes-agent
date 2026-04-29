@@ -2635,6 +2635,12 @@ class GatewayRunner:
         # Notify the chat that initiated /restart that the gateway is back.
         await self._send_restart_notification()
 
+        # Notify chats with recoverable interrupted sessions from the previous
+        # gateway process.  This is distinct from the explicit /restart notice:
+        # it targets every active run that was marked resume_pending before the
+        # process exited.
+        await self._send_recovery_notifications()
+
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
             from tools.process_registry import process_registry
@@ -8751,6 +8757,110 @@ class GatewayRunner:
                 exit_code_path.unlink(missing_ok=True)
 
         return True
+
+
+    async def _send_recovery_notifications(self) -> None:
+        """Notify chats whose in-flight sessions survived a gateway restart.
+
+        ``resume_pending`` is written before forcibly interrupting active agents
+        during shutdown/restart.  On the next startup, after adapters are
+        connected, this method sends a one-shot progress notice to the original
+        chat so users know the gateway is back and the interrupted transcript is
+        ready to continue.
+        """
+        try:
+            entries = self.session_store.list_resume_pending()
+        except AttributeError:
+            return
+        except Exception as e:
+            logger.warning("Recovery notification scan failed: %s", e)
+            return
+
+        if not entries:
+            return
+
+        notified: set[tuple[str, str, Optional[str]]] = set()
+        for entry in entries:
+            source = getattr(entry, "origin", None)
+            platform_str: Optional[str] = None
+            chat_id: Optional[str] = None
+            thread_id: Optional[str] = None
+            if source is not None:
+                platform_str = source.platform.value
+                chat_id = source.chat_id
+                thread_id = source.thread_id
+            else:
+                parsed = _parse_session_key(entry.session_key)
+                if parsed:
+                    platform_str = parsed.get("platform")
+                    chat_id = parsed.get("chat_id")
+                    thread_id = parsed.get("thread_id")
+
+            if not platform_str or not chat_id:
+                try:
+                    self.session_store.mark_recovery_notified(
+                        entry.session_key,
+                        error="missing recovery delivery target",
+                    )
+                except Exception:
+                    pass
+                continue
+
+            dedup_key = (platform_str, chat_id, thread_id)
+            if dedup_key in notified:
+                # Another session in the same chat/thread already got the
+                # startup notice; mark this one attempted to avoid spam.
+                try:
+                    self.session_store.mark_recovery_notified(entry.session_key)
+                except Exception:
+                    pass
+                continue
+
+            error: Optional[str] = None
+            try:
+                platform = Platform(platform_str)
+                adapter = self.adapters.get(platform)
+                if not adapter:
+                    error = f"{platform_str} adapter not connected"
+                else:
+                    metadata = {"thread_id": thread_id} if thread_id else None
+                    reason = getattr(entry, "resume_reason", None) or "restart_timeout"
+                    reason_text = (
+                        "网关重启"
+                        if reason == "restart_timeout"
+                        else "网关停止/重启"
+                    )
+                    msg = (
+                        f"♻ {reason_text}后已恢复。上一轮任务被标记为可继续，"
+                        "我已保留上下文；回复“继续”或直接发下一步，我会先校验状态再接着处理，避免重复副作用。"
+                    )
+                    await adapter.send(chat_id, msg, metadata=metadata)
+                    notified.add(dedup_key)
+                    logger.info(
+                        "Sent recovery notification to %s:%s",
+                        platform_str,
+                        chat_id,
+                    )
+            except Exception as e:
+                error = str(e)
+                logger.warning(
+                    "Recovery notification failed for %s:%s: %s",
+                    platform_str,
+                    chat_id,
+                    e,
+                )
+
+            try:
+                self.session_store.mark_recovery_notified(
+                    entry.session_key,
+                    error=error,
+                )
+            except Exception as e:
+                logger.debug(
+                    "Failed to mark recovery notification attempted for %s: %s",
+                    entry.session_key,
+                    e,
+                )
 
     async def _send_restart_notification(self) -> None:
         """Notify the chat that initiated /restart that the gateway is back."""

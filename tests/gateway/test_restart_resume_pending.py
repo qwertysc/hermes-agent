@@ -908,6 +908,127 @@ async def test_drain_timeout_skips_pending_sentinel_sessions():
 
 
 # ---------------------------------------------------------------------------
+# Startup recovery notification
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_notification_fields_roundtrip():
+    now = datetime(2026, 4, 18, 12, 0, 0)
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:1",
+        session_id="sid",
+        created_at=now,
+        updated_at=now,
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=now,
+        recovery_notified_at=now,
+        recovery_notification_error="adapter not connected",
+    )
+
+    restored = SessionEntry.from_dict(entry.to_dict())
+
+    assert restored.recovery_notified_at == now
+    assert restored.recovery_notification_error == "adapter not connected"
+
+
+def test_list_resume_pending_only_returns_unnotified_recoverable(tmp_path):
+    store = _make_store(tmp_path)
+    pending_source = _make_source(chat_id="pending")
+    notified_source = _make_source(chat_id="notified")
+    suspended_source = _make_source(chat_id="suspended")
+
+    pending = store.get_or_create_session(pending_source)
+    notified = store.get_or_create_session(notified_source)
+    suspended = store.get_or_create_session(suspended_source)
+
+    store.mark_resume_pending(pending.session_key)
+    store.mark_resume_pending(notified.session_key)
+    store.mark_recovery_notified(notified.session_key)
+    store.mark_resume_pending(suspended.session_key)
+    store.suspend_session(suspended.session_key)
+
+    entries = store.list_resume_pending()
+
+    assert [e.session_key for e in entries] == [pending.session_key]
+
+
+def test_mark_recovery_notified_persists_attempt(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source()
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key)
+
+    assert store.mark_recovery_notified(entry.session_key, error="send failed") is True
+
+    reloaded = _make_store(tmp_path)
+    reloaded._ensure_loaded()
+    saved = reloaded._entries[entry.session_key]
+    assert saved.recovery_notified_at is not None
+    assert saved.recovery_notification_error == "send failed"
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_notification_sends_once_and_marks_attempted():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="123456")
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:123456",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+
+    session_store = MagicMock()
+    session_store.list_resume_pending = MagicMock(return_value=[entry])
+    session_store.mark_recovery_notified = MagicMock(return_value=True)
+    runner.session_store = session_store
+
+    await runner._send_recovery_notifications()
+
+    assert len(adapter.sent) == 1
+    assert "已恢复" in adapter.sent[0]
+    assert "回复“继续”" in adapter.sent[0]
+    session_store.mark_recovery_notified.assert_called_once_with(
+        entry.session_key,
+        error=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_notification_marks_error_without_adapter():
+    runner, adapter = make_restart_runner()
+    runner.adapters = {}
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:123456",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=make_restart_source(chat_id="123456"),
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+
+    session_store = MagicMock()
+    session_store.list_resume_pending = MagicMock(return_value=[entry])
+    session_store.mark_recovery_notified = MagicMock(return_value=True)
+    runner.session_store = session_store
+
+    await runner._send_recovery_notifications()
+
+    assert adapter.sent == []
+    args, kwargs = session_store.mark_recovery_notified.call_args
+    assert args == (entry.session_key,)
+    assert "adapter not connected" in kwargs["error"]
+
+
+
+# ---------------------------------------------------------------------------
 # Shutdown banner wording
 # ---------------------------------------------------------------------------
 

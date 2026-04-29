@@ -99,6 +99,9 @@ def make_restart_runner(
     runner._notify_active_sessions_of_shutdown = (
         GatewayRunner._notify_active_sessions_of_shutdown.__get__(runner, GatewayRunner)
     )
+    runner._send_recovery_notifications = (
+        GatewayRunner._send_recovery_notifications.__get__(runner, GatewayRunner)
+    )
     runner._launch_detached_restart_command = GatewayRunner._launch_detached_restart_command.__get__(
         runner, GatewayRunner
     )
